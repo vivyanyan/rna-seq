@@ -1,0 +1,242 @@
+---
+title: "RNA-seq Analysis: Panels A–D"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Load Libraries
+
+```{r}
+library(DESeq2)
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(DOSE)
+```
+
+## Load Data and Metadata
+
+```{r}
+# Set working directory
+setwd("~/Documents/RProjects")
+
+# Load count matrix
+count_data <- read.delim("GSE246866_count_matrix.txt", row.names = 1, check.names = FALSE)
+
+# Construct metadata
+samples <- colnames(count_data)
+metadata <- data.frame(sample = samples) %>%
+  mutate(
+    vaccination = ifelse(grepl("_vaccinated_", sample), "vaccinated", "unvaccinated"),
+    replicate = as.integer(sub(".*replicate", "", sample)),
+    variant = sub("_(un)?vaccinated_replicate[0-9]+", "", sample),
+    group = paste(variant, vaccination, sep = "_")
+  )
+rownames(metadata) <- metadata$sample
+```
+
+## PCA Plot (Panel A)
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = count_data, colData = metadata, design = ~ group)
+rlog_blind <- rlog(dds, blind = TRUE)
+rlog_mat <- assay(rlog_blind)
+
+group_order <- c(
+  "Mock_unvaccinated", "Mock_vaccinated",
+  "WA1/2020_unvaccinated", "WA1/2020_vaccinated",
+  "Alpha_unvaccinated", "Alpha_vaccinated",
+  "Beta_unvaccinated", "Beta_vaccinated",
+  "Delta_unvaccinated", "Delta_vaccinated",
+  "Mu_unvaccinated", "Mu_vaccinated"
+)
+
+metadata$group <- factor(metadata$group, levels = group_order)
+metadata_ordered <- metadata %>% arrange(group, replicate)
+
+
+
+pca_df <- plotPCA(rlog_blind, intgroup = c("variant", "vaccination"), returnData = TRUE) %>%
+  mutate(Group = paste(variant, vaccination, sep = "_")) %>%
+  mutate(Group = factor(Group, levels = group_order))
+percentVar <- round(100 * attr(pca_df, "percentVar"))
+
+centroids <- pca_df %>%
+  group_by(Group, variant) %>%
+  summarize(PC1 = mean(PC1), PC2 = mean(PC2), .groups = "drop")
+
+ggplot(centroids, aes(x = PC1, y = PC2, color = Group, group = variant)) +
+  geom_point(size = 3) +
+  geom_path(linewidth = 0.5, color = "black", alpha = 0.3) +
+  geom_point(data = pca_df, size = 1, aes(x = PC1, y = PC2, color = Group)) +
+  scale_color_brewer(palette = "Paired") +
+  coord_equal() +
+  
+labs(
+    title = "Panel A: PCA (Vaccination and Variant)",
+    x = paste0("PC1: ", percentVar[1], "% variance"),
+    y = paste0("PC2: ", percentVar[2], "% variance")
+  ) +
+
+  theme_minimal()
+```
+
+## DEG Barplot (Panel B)
+
+```{r}
+dds$condition <- factor(metadata$vaccination)
+design(dds) <- ~ condition
+dds <- DESeq(dds)
+
+variants <- unique(metadata$variant)
+deg_summary <- list()
+
+for (v in variants) {
+  v_samples <- metadata %>% filter(variant == v)
+  dds_v <- dds[, v_samples$sample]
+  dds_v$condition <- factor(v_samples$vaccination)
+  design(dds_v) <- ~ condition
+  dds_v <- DESeq(dds_v)
+  res <- results(dds_v, contrast = c("condition", "vaccinated", "unvaccinated"))
+  sig <- res[which(res$padj < 0.05), ]
+  deg_summary[[v]] <- data.frame(
+    variant = v,
+    up = sum(sig$log2FoldChange > 0, na.rm = TRUE),
+    down = sum(sig$log2FoldChange < 0, na.rm = TRUE)
+  )
+}
+deg_df <- bind_rows(deg_summary)
+deg_long <- pivot_longer(deg_df, cols = c("up", "down"), names_to = "direction", values_to = "count")
+deg_long$variant <- factor(deg_long$variant, levels = c("Mock", "WA1/2020", "Alpha", "Beta", "Delta", "Mu"))
+
+ggplot(deg_long, aes(x = variant, y = count, fill = direction)) +
+  geom_bar(stat = "identity", position = "stack") +
+  coord_flip() +
+  scale_fill_manual(values = c("up" = "lightgreen", "down" = "darkred")) +
+  labs(title = "Panel B: Differentially Expressed Genes", x = "Challenge Variant", y = "Gene Count") +
+  theme_minimal()
+```
+
+## Panel C: Heatmap of GO:0051607 Genes
+
+```{r}
+gene_map <- read.delim("mart_export (2).txt", header = TRUE)
+colnames(gene_map) <- c("ensembl_gene_id", "gene_name")
+
+rlog_df <- as.data.frame(rlog_mat) %>%
+  rownames_to_column("ensembl_gene_id") %>%
+  left_join(gene_map, by = "ensembl_gene_id") %>%
+  filter(!is.na(gene_name)) %>%
+  distinct(gene_name, .keep_all = TRUE) %>%
+  column_to_rownames("gene_name") %>%
+  dplyr::select(-ensembl_gene_id)
+
+go_genes <- c("Ddx60", "Cxcl10", "Irf7", "Isg15", "Rsad2", "Ddx58", "Stat2", "Oas2",
+              "Ifitm2", "Bst2", "Ddit4", "Nlrc5", "Trex1", "Stat1", "Pycarrd", "Mov10",
+              "Prf1", "Cd8a", "RnaseL", "Nlrp3")
+
+matched_genes <- intersect(go_genes, rownames(rlog_df))
+rlog_subset <- rlog_df[matched_genes, ]
+rlog_ordered <- rlog_subset[, metadata_ordered$sample]
+
+ann_col <- data.frame(Group = metadata_ordered$group)
+rownames(ann_col) <- metadata_ordered$sample
+group_colors <- setNames(colorRampPalette(brewer.pal(12, "Paired"))(length(group_order)), group_order)
+ann_colors <- list(Group = group_colors)
+
+pheatmap(as.matrix(rlog_ordered),
+         annotation_col = ann_col,
+         annotation_colors = ann_colors,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         scale = "row",
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         fontsize = 9,
+         color = colorRampPalette(rev(brewer.pal(n = 9, name = "YlOrRd")))(100),
+         main = "Panel C: GO:0051607 Defense Response Genes")
+```
+
+## Panel D: Top 1000 DEGs + Cluster 1/2
+
+```{r}
+res_all <- results(dds, contrast = c("condition", "vaccinated", "unvaccinated"))
+res_all <- res_all[order(res_all$padj), ]
+top1000_ids <- head(rownames(res_all), 1000)
+top1000_mat <- rlog_mat[top1000_ids, ]
+top1000_ordered <- top1000_mat[, metadata_ordered$sample]
+
+# Cluster rows
+row_dist <- dist(top1000_ordered)
+row_clust <- hclust(row_dist, method = "ward.D2")
+cluster_assignments <- cutree(row_clust, k = 2)
+
+cluster_df <- data.frame(gene_id = rownames(top1000_ordered),
+                         cluster = as.factor(cluster_assignments)) %>%
+  left_join(gene_map, by = c("gene_id" = "ensembl_gene_id")) %>%
+  filter(!is.na(gene_name)) %>%
+  distinct(gene_name, cluster, .keep_all = TRUE)
+
+cluster1_genes <- cluster_df %>% filter(cluster == 1) %>% pull(gene_name)
+cluster2_genes <- cluster_df %>% filter(cluster == 2) %>% pull(gene_name)
+
+writeLines(cluster1_genes, "cluster1_genes.txt")
+writeLines(cluster2_genes, "cluster2_genes.txt")
+
+pheatmap(top1000_ordered,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,
+         clustering_method = "ward.D2",
+         annotation_col = ann_col,
+         annotation_colors = ann_colors,
+         scale = "row",
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         fontsize = 9,
+         color = colorRampPalette(rev(brewer.pal(n = 9, name = "RdBu")))(100),
+         main = "Panel D: Top 1000 DEGs Clustering")
+```
+
+
+## GO Enrichment Analysis for Cluster 1 and Cluster 2
+
+```{r go-enrichment-cluster1-2}
+# Convert gene symbols to Entrez IDs for each cluster
+cluster1_entrez <- bitr(cluster1_genes, fromType = "SYMBOL",
+                        toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+cluster2_entrez <- bitr(cluster2_genes, fromType = "SYMBOL",
+                        toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+
+# GO enrichment for Biological Processes
+go_cluster1 <- enrichGO(gene = cluster1_entrez$ENTREZID,
+                        OrgDb = org.Mm.eg.db,
+                        keyType = "ENTREZID",
+                        ont = "BP",
+                        pAdjustMethod = "BH",
+                        qvalueCutoff = 0.2,
+                        readable = TRUE)
+
+go_cluster2 <- enrichGO(gene = cluster2_entrez$ENTREZID,
+                        OrgDb = org.Mm.eg.db,
+                        keyType = "ENTREZID",
+                        ont = "BP",
+                        pAdjustMethod = "BH",
+                        qvalueCutoff = 0.2,
+                        readable = TRUE)
+
+
+# Dotplots with improved y-axis spacing
+dotplot(go_cluster1, showCategory = 15) +
+  ggtitle("GO Enrichment for Cluster 1") +
+  theme(axis.text.y = element_text(size = 10, margin = margin(r = 10)))
+
+dotplot(go_cluster2, showCategory = 15) +
+  ggtitle("GO Enrichment for Cluster 2") +
+  theme(axis.text.y = element_text(size = 10, margin = margin(r = 10)))
+
+```
